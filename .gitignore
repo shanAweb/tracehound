@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated benchmark/simulator output (regenerated, never hand-edited)
+bench_out/
+incidents_out/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
