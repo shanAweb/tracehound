@@ -31,5 +31,12 @@ def test_format_value_rejects_zero_decimals() -> None:
 
 
 def test_metric_names_are_in_alphabetical_row_order() -> None:
-    names = [fmt.ERROR_RATE, fmt.LATENCY_P50, fmt.LATENCY_P95, fmt.LATENCY_P99, fmt.THROUGHPUT]
+    names = [
+        fmt.ERROR_RATE,
+        fmt.LATENCY_P50,
+        fmt.LATENCY_P95,
+        fmt.LATENCY_P99,
+        fmt.THROUGHPUT,
+        fmt.UTILIZATION,
+    ]
     assert names == sorted(names)

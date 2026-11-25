@@ -6,6 +6,8 @@ Keeping names here means the simulator (writer) and ingest (reader) cannot drift
 
 from typing import Final
 
+JsonValue = int | float | str | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
+
 FORMAT_VERSION: Final = 1
 
 META_FILE: Final = "meta.json"
@@ -31,6 +33,7 @@ LATENCY_P50: Final = "latency_p50_ms"
 LATENCY_P95: Final = "latency_p95_ms"
 LATENCY_P99: Final = "latency_p99_ms"
 THROUGHPUT: Final = "throughput_rps"
+UTILIZATION: Final = "utilization"
 
 STATUS_OK: Final = "ok"
 STATUS_ERROR: Final = "error"

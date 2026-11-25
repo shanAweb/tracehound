@@ -9,8 +9,8 @@ no API key, benchmarked on a built-in fault simulator.
 ![Python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-> **Status: pre-alpha. Steps 1 and 2a of the roadmap are done: project skeleton, CI, and the
-> simulator generating healthy traffic.**
+> **Status: pre-alpha. Steps 1 and 2 of the roadmap are done: project skeleton, CI, and a
+> fault-injection simulator that produces labelled incidents.**
 > Tracehound is being built in small, tested, separately-committed steps. Anything marked
 > *planned* below does not work yet. The [Roadmap](#roadmap) shows exactly what exists today.
 
@@ -117,8 +117,8 @@ incident folder --> 1 Ingest --> 2 Detect --> 3 Correlate --> 4 Localize --> 5 R
 ## The built-in simulator
 
 Real multi-service incident data with a *known* cause is hard to get, so Tracehound ships its own
-source. The simulator runs synthetic traffic through a small microservice system. Faults can be
-planted (Step 2b), and because we planted them, the true cause is known. That makes accuracy
+source. The simulator runs synthetic traffic through a small microservice system and plants
+faults in it. Because we planted them, the true cause is known. That makes accuracy
 measurable, makes the benchmark reproducible, and gives every reader a demo that needs none of
 their own data.
 
@@ -142,7 +142,8 @@ frontend ─┬─> auth
 | Calls | Made one after another, in topology order. A span's duration is its own time plus its callees' time. |
 | Errors | Each service fails by itself with probability `error_rate` (0.1% by default). A failure propagates to the caller, which stops making further calls. |
 | Timeouts | Each call has a timeout. If the callee is slower, the caller gives up and fails, while the callee's own span keeps running, as in real systems. Healthy `shop` latencies are at least 5x below every timeout. |
-| Metrics | Computed from **every** request, per service, per interval (default 1 s): p50/p95/p99 latency, error rate, throughput. |
+| Metrics | Computed from **every** request, per service, per interval (default 1 s): p50/p95/p99 latency, error rate, throughput, utilization. |
+| Utilization | Requests in flight ÷ the service's `capacity` (Little's law), plus any pool share held by a saturation leak, capped at 1.0 like a real pool gauge. Every service reports it, so its presence never gives away the faulty one. Capacities are sized for about 50 rps (healthy utilization 0.2-0.35); higher rps only raises the gauge, without queueing. |
 | Traces | **Head-sampled** (default 10%): a request's whole trace is kept or dropped. |
 | Window | The run records spans that *start* inside `[start, start + duration)`, like an export cut at end time. |
 | Determinism | One seeded generator (`random.Random(seed)`) drives everything. The same seed gives byte-identical files. |
@@ -153,20 +154,59 @@ frontend ─┬─> auth
 |---|---|
 | Requests simulated | 29,721 (Poisson mean 30,000) |
 | Traces kept | 2,927 (9.85%) with 15,679 spans, 5.36 spans per trace |
-| Simulation time | 1.01 s, plus 0.14 s to write the files |
-| Folder size | 4.8 MB (3.8 MB traces, 1.0 MB metrics) |
+| Simulation time | 0.98 s (best of 3), plus 0.16 s to write the files |
+| Folder size | 5.0 MB (3.8 MB traces, 1.2 MB metrics) |
+
+### Planting faults
+
+```python
+from tracehound.sim import Fault
+
+Fault("latency", service="payments-db", at="+4m")  # slows down from 4 min after start
+Fault("error", service="cart", at="+2m", duration="1m", strength=0.5)  # fails 50% for 1 min
+```
+
+`at` is the offset from the start of the run (`0`, `90`, `"4m"` or `"+4m"`). `duration` defaults to
+"until the run ends". `strength` defaults per kind:
+
+| Kind | `strength` means | Default | What it models |
+|---|---|---|---|
+| `latency` | extra own processing time, in ms | 850 | a slow dependency (the spec's "40 ms -> 900 ms") |
+| `error` | chance a request fails inside the service | 0.3 | a bad deploy or a failing dependency |
+| `saturation` | seconds until the service's pool is exhausted | 300 | a connection or memory leak: requests queue as the pool fills (own time x 1/(1 - leaked), at most 20x), then every request is rejected |
+| `regression` | multiplier on own processing time | 1.3 | a new version that is quietly slower (for Guard) |
+
+A fault is applied when a service *starts* handling a request. Several faults can be active at
+once: added latencies sum, multipliers multiply, and the highest error rate wins.
+
+**What a fault looks like from the outside.** Measured on `shop` (2 min at 50 rps, seed 3; latency and
+error faults at +60 s, averaged over +65 s to +115 s). Each row is checked by
+`tests/sim/test_sim_propagation.py`:
+
+| Planted fault | Root cause | Victims (error rate after onset) | Untouched |
+|---|---|---|---|
+| `latency` in payments-db | p50 40 -> 904 ms | cart 0.99, checkout 1.00, frontend 0.31; payments traffic drops 14.4 -> 0.14 rps (checkout fails before calling it) | auth, catalog, catalog-db |
+| `error` 0.3 in payments-db | errors 0.31 | cart 0.30, payments 0.32, checkout 0.53 (expected 1 - 0.7² = 0.51), frontend 0.16 | auth, catalog, catalog-db |
+| `saturation` in catalog-db (60 s to exhaustion, from +30 s) | utilization 0.30 -> 0.39 -> 0.62 -> 0.90 -> 1.00 over +30 s to +70 s; p50 6 -> 80 ms; then 100% errors from +90 s | catalog 1.00, frontend 1.00 | checkout path (never reached) |
+| `regression` x1.3 in payments-db | p50 x1.30 | none: the highest error rate anywhere is 0.005, so only a baseline comparison reveals it | everything |
 
 ## Usage
 
-### Works today: simulate a system and save the telemetry
+### Works today: simulate a system, plant a fault, save the telemetry
 
 ```python
-from tracehound.sim import System
+from tracehound.sim import Fault, System
 
 system = System.example("shop")
-run = system.run(duration="10m", rps=50, seed=7)  # trace_sample_rate=0.1, metric_interval_s=1.0
-print(run.n_requests, len(run.spans))  # 29721 15679
-run.save("runs/shop_seed7/")  # meta.json, metrics.csv, traces.jsonl, ground_truth.json
+
+healthy = system.run(duration="10m", rps=50, seed=7)  # trace_sample_rate=0.1, metric_interval_s=1.0
+print(healthy.n_requests, len(healthy.spans))  # 29721 15679
+healthy.save("runs/shop_seed7/")  # meta.json, metrics.csv, traces.jsonl, ground_truth.json
+
+incident = system.run(
+    duration="10m", rps=50, seed=7, faults=[Fault("latency", service="payments-db", at="+4m")]
+)
+incident.save("incidents/payments_latency/")  # ground_truth.json records the planted cause
 ```
 
 ### Planned API
@@ -185,21 +225,6 @@ report.to_json("report.json")
 # Guard: fail a CI build on a reliability regression
 result = th.guard(candidate="runs/pr_241/", baseline="runs/main/")  # baseline: folder of >= 3 runs
 assert result.ok, result.regressions
-```
-
-Plant a fault (Step 2b), so the true cause is known:
-
-```python
-from tracehound.sim import System, Fault
-
-system = System.example("shop")  # checkout, cart, payments-db, auth, ...
-incident = system.run(
-    duration="10m",
-    rps=50,
-    seed=7,
-    faults=[Fault("latency", service="payments-db", at="+4m")],
-)
-incident.save("incidents/payments_latency/")  # metrics + traces + ground_truth.json
 ```
 
 Example Explain output (illustrative):
@@ -253,12 +278,13 @@ timestamp_ms,service,metric,value
 | `latency_p50_ms`, `latency_p95_ms`, `latency_p99_ms` | milliseconds | up |
 | `error_rate` | fraction 0-1 | up |
 | `throughput_rps` | requests / second | down |
+| `utilization` | fraction 0-1 of capacity in use | up |
 | anything else (e.g. `db_connections`) | as named | either (two-sided) |
 
 Rules for `metrics.csv`:
 - `timestamp_ms` is the **start** of the interval. A request counts in the interval in which it started.
-- An interval with no requests has only `throughput_rps = 0`. Latency and error rate are left out,
-  because they are undefined for zero requests and are never invented.
+- An interval with no requests has only `throughput_rps = 0` and `utilization`. Latency and error
+  rate are left out, because they are undefined for zero requests and are never invented.
 - Values are rounded to 4 decimals, with trailing zeros dropped (`3`, `41.2`, `0.0012`).
 
 **`traces.jsonl`** has one span per line, sorted by `start_ns`, then `span_id`:
@@ -270,11 +296,26 @@ Rules for `metrics.csv`:
 `status` is `"ok"` or `"error"`. All times are integer Unix epochs whose unit is in the field name
 (`_ns` = nanoseconds, `_ms` = milliseconds).
 
-**`ground_truth.json`** (simulator only):
+**`ground_truth.json`** (simulator only) records the seed and every planted fault, sorted by onset.
+A healthy run has `"faults": []`.
 
 ```json
-{"seed": 7, "faults": [{"kind": "latency", "service": "payments-db", "start_ns": 1767225840000000000, "params": {"added_ms": 850}}]}
+{
+  "faults": [
+    {
+      "end_ns": 1767226200000000000,
+      "kind": "latency",
+      "params": {"added_ms": 850.0},
+      "service": "payments-db",
+      "start_ns": 1767225840000000000
+    }
+  ],
+  "seed": 7
+}
 ```
+
+`params` holds one entry named after the kind: `added_ms` (latency), `error_rate` (error),
+`time_to_exhaustion_s` (saturation) or `latency_factor` (regression).
 
 *Planned:* an adapter for OpenTelemetry OTLP-JSON exports, so real collector output can be used directly.
 
@@ -357,8 +398,9 @@ tracehound/
 │   ├── sim/             fault-injection simulator (ground-truth incidents)
 │   │   ├── topology.py    Service, Call, Topology (validated: acyclic, all reachable)
 │   │   ├── examples.py    ready-made systems, e.g. "shop"
+│   │   ├── faults.py      Fault (latency, error, saturation, regression) and FaultPlan
 │   │   ├── request.py     one request -> one span per service (latency, errors, timeouts)
-│   │   ├── metrics.py     spans -> per-interval p50/p95/p99, error rate, throughput
+│   │   ├── metrics.py     spans -> per-interval p50/p95/p99, error rate, throughput, utilization
 │   │   ├── writer.py      deterministic incident-folder writer
 │   │   ├── system.py      System.run(): traffic, sampling, recording window -> SimRun
 │   │   └── units.py       "10m" / "30s" duration parsing
@@ -375,8 +417,8 @@ Each step is built, tested and pushed on its own.
 |---|---|---|---|
 | 1 | Project skeleton, tooling, CI, format spec | Installs; lint, types and tests pass | ✅ done |
 | 2a | Simulator: healthy traffic | Same seed -> byte-identical folder, also across processes | ✅ done |
-| 2b | Simulator: fault injection | 4 fault types; faults spread to callers; ground truth written | ⏳ next |
-| 3 | Ingest + Detect | Folder round-trips; detector accuracy and onset error measured | planned |
+| 2b | Simulator: fault injection | 4 fault types; faults spread to callers; ground truth written | ✅ done |
+| 3 | Ingest + Detect | Folder round-trips; detector accuracy and onset error measured | ⏳ next |
 | 4 | Graph + Localize | Top-1/Top-3/MRR with intervals on dev seeds; ablation table | planned |
 | 5 | Explain report | Golden-file tests; identical bytes across processes | planned |
 | 6 | Guard | Recall >= 0.90 and FPR <= 0.05 on held-out seeds | planned |

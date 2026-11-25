@@ -16,16 +16,19 @@ from tracehound.sim.topology import Call, Service, Topology
 
 
 def shop() -> Topology:
-    """An 8-service web shop. Healthy latencies sit far below every timeout."""
+    """An 8-service web shop. Healthy latencies sit far below every timeout.
+
+    Capacities are sized so that healthy utilization is roughly 0.2-0.35 at 50 rps.
+    """
     services = [
-        Service("frontend", "GET /", base_ms=8),
-        Service("auth", "POST /verify", base_ms=4),
-        Service("catalog", "GET /products", base_ms=12),
-        Service("catalog-db", "SELECT products", base_ms=6),
-        Service("checkout", "POST /checkout", base_ms=15),
-        Service("cart", "GET /cart", base_ms=6),
-        Service("payments", "POST /charge", base_ms=20),
-        Service("payments-db", "UPDATE ledger", base_ms=40),
+        Service("frontend", "GET /", base_ms=8, capacity=10),
+        Service("auth", "POST /verify", base_ms=4, capacity=1),
+        Service("catalog", "GET /products", base_ms=12, capacity=3),
+        Service("catalog-db", "SELECT products", base_ms=6, capacity=1),
+        Service("checkout", "POST /checkout", base_ms=15, capacity=6),
+        Service("cart", "GET /cart", base_ms=6, capacity=2),
+        Service("payments", "POST /charge", base_ms=20, capacity=3),
+        Service("payments-db", "UPDATE ledger", base_ms=40, capacity=4),
     ]
     calls = [
         Call("frontend", "auth", timeout_ms=200),

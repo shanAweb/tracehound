@@ -10,12 +10,17 @@ Model of a single service handling a request:
      makes no further calls. The callee's own span still runs to completion, as in real
      systems where the server never learns that the client gave up.
    - if a callee fails, the caller fails too and makes no further calls (fail fast).
+
+Active faults (see ``faults.py``) are looked up when a service *starts* handling a request:
+they stretch its own time ``(base_ms * latency_factor + extra_ms)``, raise its error rate, or,
+when its pool is exhausted, make it fail at once.
 """
 
 import random
 from typing import NamedTuple
 
 from tracehound._format import NS_PER_MS
+from tracehound.sim.faults import NO_EFFECT, FaultPlan
 from tracehound.sim.topology import Topology
 
 
@@ -38,9 +43,12 @@ def ms_to_ns(ms: float) -> int:
 class RequestSimulator:
     """Walks requests through a topology using one seeded random generator."""
 
-    def __init__(self, topology: Topology, rng: random.Random) -> None:
+    def __init__(
+        self, topology: Topology, rng: random.Random, faults: FaultPlan | None = None
+    ) -> None:
         self._topology = topology
         self._rng = rng
+        self._faults = faults
 
     def simulate(self, start_ns: int, sampled: bool) -> list[SpanRecord]:
         """Run one request that arrives at the entry service at ``start_ns``.
@@ -63,12 +71,15 @@ class RequestSimulator:
     ) -> tuple[int, bool]:
         """Simulate ``name`` handling the request. Returns ``(end_ns, failed)``."""
         service = self._topology.services[name]
+        effect = self._faults.effect(name, start_ns) if self._faults else NO_EFFECT
         span_id = f"{self._rng.getrandbits(64):016x}" if trace_id else ""
-        own_ns = ms_to_ns(service.base_ms * self._rng.lognormvariate(0.0, service.jitter))
+        median_ms = service.base_ms * effect.latency_factor + effect.extra_ms
+        own_ns = ms_to_ns(median_ms * self._rng.lognormvariate(0.0, service.jitter))
         before_calls_ns = own_ns // 2
 
         clock = start_ns + before_calls_ns
-        failed = self._rng.random() < service.error_rate
+        error_rate = max(service.error_rate, effect.error_rate)
+        failed = effect.exhausted or self._rng.random() < error_rate
         if not failed:
             clock, failed = self._call_callees(name, clock, trace_id, span_id, out)
 

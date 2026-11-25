@@ -10,10 +10,9 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from tracehound import _format as fmt
+from tracehound._format import JsonValue
 from tracehound.sim.metrics import MetricRow
 from tracehound.sim.request import SpanRecord
-
-JsonValue = int | float | str | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 
 
 def write_incident(

@@ -2,7 +2,7 @@
 
 import pytest
 
-from tracehound.sim.units import parse_duration, seconds_to_ns
+from tracehound.sim.units import parse_duration, parse_offset, seconds_to_ns
 
 
 @pytest.mark.parametrize(
@@ -38,3 +38,16 @@ def test_rejects_bool() -> None:
 def test_seconds_to_ns() -> None:
     assert seconds_to_ns(1.5) == 1_500_000_000
     assert seconds_to_ns(600) == 600_000_000_000
+
+
+@pytest.mark.parametrize(
+    ("value", "seconds"), [("+4m", 240.0), ("4m", 240.0), (" +30s", 30.0), (0, 0.0), (90, 90.0)]
+)
+def test_parses_offsets_including_zero_and_plus_sign(value: str | float, seconds: float) -> None:
+    assert parse_offset(value) == seconds
+
+
+@pytest.mark.parametrize("bad", [-1, "-1m", "+", "soon"])
+def test_rejects_bad_offsets(bad: str | float) -> None:
+    with pytest.raises(ValueError):
+        parse_offset(bad)

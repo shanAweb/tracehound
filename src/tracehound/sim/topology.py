@@ -11,7 +11,9 @@ class Service:
 
     Its own processing time (excluding callees) is lognormal around ``base_ms``, so
     ``base_ms`` is the median and ``jitter`` the lognormal sigma. ``error_rate`` is the
-    chance that a request fails inside this service itself.
+    chance that a request fails inside this service itself. ``capacity`` is how many
+    requests it can work on at once (its pool size). It is used for the ``utilization``
+    metric and by saturation faults.
     """
 
     name: str
@@ -19,6 +21,7 @@ class Service:
     base_ms: float
     jitter: float = 0.25
     error_rate: float = 0.001
+    capacity: float = 10.0
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -29,6 +32,8 @@ class Service:
             raise ValueError(f"{self.name}: jitter must be >= 0")
         if not 0.0 <= self.error_rate <= 1.0:
             raise ValueError(f"{self.name}: error_rate must be in [0, 1]")
+        if not self.capacity > 0:
+            raise ValueError(f"{self.name}: capacity must be > 0")
 
 
 @dataclass(frozen=True)

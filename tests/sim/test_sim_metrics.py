@@ -30,7 +30,7 @@ def rows() -> list[MetricRow]:
         span("x", 999 * MS, 40),
         span("x", 2 * S, 5),
     ]
-    return aggregate(spans, ["x", "idle"], start_ns=0, end_ns=3 * S, interval_ns=S)
+    return aggregate(spans, {"x": 2.0, "idle": 1.0}, start_ns=0, end_ns=3 * S, interval_ns=S)
 
 
 def test_error_rate_and_throughput(rows: list[MetricRow]) -> None:
@@ -45,11 +45,31 @@ def test_latency_percentiles_match_numpy(rows: list[MetricRow]) -> None:
     assert values(rows, "x", fmt.LATENCY_P50)[2000] == pytest.approx(5.0)
 
 
-def test_empty_bucket_only_reports_zero_throughput(rows: list[MetricRow]) -> None:
+def test_empty_bucket_reports_only_throughput_and_utilization(rows: list[MetricRow]) -> None:
     in_bucket_1 = sorted(r.metric for r in rows if r.service == "x" and r.timestamp_ms == 1000)
-    assert in_bucket_1 == [fmt.THROUGHPUT]
+    assert in_bucket_1 == [fmt.THROUGHPUT, fmt.UTILIZATION]
     idle = [r for r in rows if r.service == "idle"]
-    assert {r.metric for r in idle} == {fmt.THROUGHPUT} and all(r.value == 0 for r in idle)
+    assert {r.metric for r in idle} == {fmt.THROUGHPUT, fmt.UTILIZATION}
+    assert all(r.value == 0 for r in idle)
+
+
+def test_utilization_is_busy_time_over_capacity(rows: list[MetricRow]) -> None:
+    # Bucket 0: 10+20+30+40 = 100 ms busy in a 1000 ms interval = 0.1 in flight; capacity 2.
+    assert values(rows, "x", fmt.UTILIZATION) == pytest.approx({0: 0.05, 1000: 0.0, 2000: 0.0025})
+
+
+def test_utilization_adds_leaked_share_and_caps_at_one() -> None:
+    spans = [span("x", 0, 500)]  # 0.5 in flight on capacity 1
+
+    def leaked(service: str, t_ns: int) -> float:
+        return {0: 0.2, S: 0.9}[t_ns]
+
+    rows = aggregate(
+        spans, {"x": 1.0}, start_ns=0, end_ns=2 * S, interval_ns=S, leaked_share=leaked
+    )
+    assert values(rows, "x", fmt.UTILIZATION) == pytest.approx({0: 0.7, 1000: 0.9})
+    capped = aggregate([span("x", 0, 900)], {"x": 0.5}, 0, S, S, leaked_share=lambda s, t: 0.5)
+    assert values(capped, "x", fmt.UTILIZATION) == {0: 1.0}
 
 
 def test_rows_are_in_file_order(rows: list[MetricRow]) -> None:
@@ -59,10 +79,10 @@ def test_rows_are_in_file_order(rows: list[MetricRow]) -> None:
 
 def test_span_starting_outside_the_window_is_a_bug() -> None:
     with pytest.raises(ValueError, match="outside the run window"):
-        aggregate([span("x", 5 * S, 1)], ["x"], start_ns=0, end_ns=3 * S, interval_ns=S)
+        aggregate([span("x", 5 * S, 1)], {"x": 1.0}, start_ns=0, end_ns=3 * S, interval_ns=S)
 
 
 @pytest.mark.parametrize("interval_ns", [0, MS // 2, MS + 1])
 def test_interval_must_be_whole_milliseconds(interval_ns: int) -> None:
     with pytest.raises(ValueError, match="milliseconds"):
-        aggregate([], ["x"], start_ns=0, end_ns=S, interval_ns=interval_ns)
+        aggregate([], {"x": 1.0}, start_ns=0, end_ns=S, interval_ns=interval_ns)
