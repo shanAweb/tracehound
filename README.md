@@ -9,8 +9,9 @@ no API key, benchmarked on a built-in fault simulator.
 ![Python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-> **Status: pre-alpha. Steps 1 and 2 of the roadmap are done: project skeleton, CI, and a
-> fault-injection simulator that produces labelled incidents.**
+> **Status: pre-alpha. Steps 1, 2 and 3a of the roadmap are done: project skeleton, CI, a
+> fault-injection simulator that produces labelled incidents, and `tracehound.load()`, which reads
+> and validates an incident folder.**
 > Tracehound is being built in small, tested, separately-committed steps. Anything marked
 > *planned* below does not work yet. The [Roadmap](#roadmap) shows exactly what exists today.
 
@@ -87,7 +88,7 @@ incident folder --> 1 Ingest --> 2 Detect --> 3 Correlate --> 4 Localize --> 5 R
 
 | Stage | Does | Technique (no model, no key) |
 |---|---|---|
-| 1 Ingest | Reads metrics and trace spans into typed, columnar data | stdlib `csv`/`json` + numpy |
+| 1 Ingest | Reads and validates metrics and trace spans into typed, columnar data | stdlib `csv`/`json` + numpy |
 | 2 Detect | Flags anomalous signals against their own pre-incident baseline and estimates **when** each change began | robust z-score (median/MAD) + CUSUM change-point |
 | 3 Correlate | Groups anomalies that begin close together into one incident | 1-D gap clustering on onset times |
 | 4 Localize | Builds the service graph from traces and ranks the most likely cause | networkx + personalized PageRank + timing |
@@ -209,6 +210,50 @@ incident = system.run(
 incident.save("incidents/payments_latency/")  # ground_truth.json records the planted cause
 ```
 
+### Works today: load an incident folder
+
+`load()` reads and validates a folder in the [incident format](#input-format-the-incident-folder)
+and returns an `Incident`. Metrics and spans are held as read-only numpy arrays, sorted, so the same
+folder always loads the same way whatever the order of its lines.
+
+```python
+import tracehound as th
+
+incident = th.load("incidents/payments_latency/")
+print(incident)
+# Incident(path='incidents/payments_latency', services=8, duration_s=600, series=48,
+#          spans=14764, planted_faults=1)
+
+# Metrics: one Series per (service, metric)
+p50 = incident.metrics["payments-db", "latency_p50_ms"]
+p50.timestamps_ms, p50.values  # numpy int64 and float64 arrays, sorted by time
+
+# Spans: one numpy array per field, sorted by (start_ns, span_id)
+db = incident.spans.of_service("payments-db")
+db.start_ns, db.duration_ns, db.error, db.parent_span_id  # parent "" means a root span
+
+# Ground truth (simulated runs only; None otherwise)
+print(incident.ground_truth.faults[0])
+# PlantedFault(kind='latency', service='payments-db', start_ns=1767225840000000000,
+#              end_ns=1767226200000000000, params={'added_ms': 850.0})
+```
+
+| Object | What it holds |
+|---|---|
+| `Incident` | `meta`, `metrics`, `spans`, `ground_truth`, `path`, and `services` (every service seen) |
+| `Meta` | `start_ns`, `end_ns`, `metric_interval_s`, `trace_sample_rate`, `source`, `duration_s` |
+| `Metrics` | a read-only mapping `(service, metric) -> Series`, iterated in sorted order; `services`, `of_service(name)` |
+| `Series` | `service`, `metric`, `timestamps_ms`, `values` |
+| `Spans` | columns `trace_id`, `span_id`, `parent_span_id`, `service`, `name`, `start_ns`, `end_ns`, `error`; `duration_ns`, `services`, `of_service(name)`, `select(mask)` |
+| `GroundTruth` | `seed` and `faults` (each a `PlantedFault`: `kind`, `service`, `start_ns`, `end_ns`, `params`) |
+
+A folder that breaks the format fails with an `IncidentFormatError` naming the file, the line and
+the reason, for example:
+
+```text
+tracehound.IncidentFormatError: incidents/bad/metrics.csv:17: value must be a number, got 'fast'
+```
+
 ### Planned API
 
 > *Planned.* This is the target public surface, built step by step; see the [Roadmap](#roadmap).
@@ -217,7 +262,7 @@ incident.save("incidents/payments_latency/")  # ground_truth.json records the pl
 import tracehound as th
 
 # Explain: post-incident root cause
-incident = th.load("incidents/payments_latency/")
+incident = th.load("incidents/payments_latency/")  # works today (see above)
 report = th.explain(incident)
 print(report.top(3))  # ranked causes + evidence
 report.to_json("report.json")
@@ -252,7 +297,8 @@ my_incident/
   ground_truth.json  optional  - the planted cause (simulator output only)
 ```
 
-**`meta.json`**
+**`meta.json`**: `format_version` (must be `1`), `start_ns`, `end_ns` (after `start_ns`) and
+`metric_interval_s` (> 0) are required. `trace_sample_rate` (in (0, 1]) and `source` are optional.
 
 ```json
 {
@@ -294,7 +340,8 @@ Rules for `metrics.csv`:
 ```
 
 `status` is `"ok"` or `"error"`. All times are integer Unix epochs whose unit is in the field name
-(`_ns` = nanoseconds, `_ms` = milliseconds).
+(`_ns` = nanoseconds, `_ms` = milliseconds). A root span has `parent_span_id` set to `null` or `""`,
+or leaves it out. Extra fields, such as OpenTelemetry `attributes`, are allowed and ignored.
 
 **`ground_truth.json`** (simulator only) records the seed and every planted fault, sorted by onset.
 A healthy run has `"faults": []`.
@@ -316,6 +363,18 @@ A healthy run has `"faults": []`.
 
 `params` holds one entry named after the kind: `added_ms` (latency), `error_rate` (error),
 `time_to_exhaustion_s` (saturation) or `latency_factor` (regression).
+
+**What `load()` checks.** It stops at the first problem and reports it as `file:line: reason`.
+
+| File | Checks |
+|---|---|
+| all | the three required files exist; text is valid UTF-8; JSON is valid and has no `NaN` or `Infinity` |
+| `meta.json` | required fields present; integers are real integers (`true` and `"12"` are rejected) and fit in 64 bits; `end_ns > start_ns`; `format_version` is supported |
+| `metrics.csv` | exact header; 4 fields per row; `timestamp_ms` is a plain integer inside the recording window `[start_ns, end_ns)`; `value` is a finite number; no duplicate `(service, metric, timestamp_ms)` |
+| `traces.jsonl` | one JSON object per line (blank lines skipped); required fields and types; `start_ns` inside the recording window; `end_ns >= start_ns`; `status` is `ok` or `error`; no duplicate `span_id` within a trace |
+| `ground_truth.json` | `faults` is a list; every fault has `kind`, `service`, `start_ns < end_ns` and numeric `params` |
+
+Rows and spans may appear in any order. `load()` sorts them, so the result does not depend on it.
 
 *Planned:* an adapter for OpenTelemetry OTLP-JSON exports, so real collector output can be used directly.
 
@@ -391,6 +450,12 @@ tracehound/
 │   ├── __init__.py      public API: load(), explain(), guard()  (built step by step)
 │   ├── _format.py       incident-folder constants shared by every writer and reader
 │   ├── ingest/          stage 1: incident folder -> typed data
+│   │   ├── incident.py    Incident and load(): validates the folder, reads each file
+│   │   ├── meta.py        Meta: the recording window
+│   │   ├── metrics.py     Series and Metrics: one numpy series per (service, metric)
+│   │   ├── spans.py       Spans: every span as numpy columns, sorted by start time
+│   │   ├── ground_truth.py  GroundTruth and PlantedFault (simulated runs)
+│   │   └── _checks.py     IncidentFormatError and typed field checks
 │   ├── detect/          stage 2: anomaly + onset detection (robust z, CUSUM)
 │   ├── correlate/       stage 3: group anomalies into one incident
 │   ├── graph/           stage 4: build call graph, rank root causes
@@ -405,7 +470,7 @@ tracehound/
 │   │   ├── system.py      System.run(): traffic, sampling, recording window -> SimRun
 │   │   └── units.py       "10m" / "30s" duration parsing
 │   └── bench/           benchmark harness -> results.json
-├── tests/               unit tests per stage + end-to-end scenarios (tests/sim/ for the simulator)
+├── tests/               unit tests per stage + end-to-end scenarios (tests/sim/, tests/ingest/)
 └── pyproject.toml       packaging + tool configuration
 ```
 
@@ -418,7 +483,8 @@ Each step is built, tested and pushed on its own.
 | 1 | Project skeleton, tooling, CI, format spec | Installs; lint, types and tests pass | ✅ done |
 | 2a | Simulator: healthy traffic | Same seed -> byte-identical folder, also across processes | ✅ done |
 | 2b | Simulator: fault injection | 4 fault types; faults spread to callers; ground truth written | ✅ done |
-| 3 | Ingest + Detect | Folder round-trips; detector accuracy and onset error measured | ⏳ next |
+| 3a | Ingest | Simulator output round-trips exactly; every format rule rejects bad input with file and line | ✅ done |
+| 3b | Detect | Detector recall, false-alarm rate and onset error measured against ground truth | ⏳ next |
 | 4 | Graph + Localize | Top-1/Top-3/MRR with intervals on dev seeds; ablation table | planned |
 | 5 | Explain report | Golden-file tests; identical bytes across processes | planned |
 | 6 | Guard | Recall >= 0.90 and FPR <= 0.05 on held-out seeds | planned |
