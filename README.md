@@ -9,7 +9,8 @@ no API key, benchmarked on a built-in fault simulator.
 ![Python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-> **Status: pre-alpha, Step 1 of the roadmap is done (project skeleton, tooling, CI).**
+> **Status: pre-alpha. Steps 1 and 2a of the roadmap are done: project skeleton, CI, and the
+> simulator generating healthy traffic.**
 > Tracehound is being built in small, tested, separately-committed steps. Anything marked
 > *planned* below does not work yet. The [Roadmap](#roadmap) shows exactly what exists today.
 
@@ -20,15 +21,16 @@ no API key, benchmarked on a built-in fault simulator.
 1. [Why Tracehound](#why-tracehound)
 2. [The three modes](#the-three-modes)
 3. [How it works](#how-it-works)
-4. [Usage (planned API)](#usage-planned-api)
-5. [Input format: the incident folder](#input-format-the-incident-folder)
-6. [How quality is measured](#how-quality-is-measured)
-7. [Installation](#installation)
-8. [Development](#development)
-9. [Project layout](#project-layout)
-10. [Roadmap](#roadmap)
-11. [Out of scope for v0](#out-of-scope-for-v0)
-12. [License](#license)
+4. [The built-in simulator](#the-built-in-simulator)
+5. [Usage](#usage)
+6. [Input format: the incident folder](#input-format-the-incident-folder)
+7. [How quality is measured](#how-quality-is-measured)
+8. [Installation](#installation)
+9. [Development](#development)
+10. [Project layout](#project-layout)
+11. [Roadmap](#roadmap)
+12. [Out of scope for v0](#out-of-scope-for-v0)
+13. [License](#license)
 
 ---
 
@@ -112,9 +114,64 @@ incident folder --> 1 Ingest --> 2 Detect --> 3 Correlate --> 4 Localize --> 5 R
 > payments-db is *downstream* of cart in call order (cart calls it) but *upstream* in fault
 > order (its failure flows to cart).
 
-## Usage (planned API)
+## The built-in simulator
 
-> *Planned.* This is the target public surface. It is built step by step; see the [Roadmap](#roadmap).
+Real multi-service incident data with a *known* cause is hard to get, so Tracehound ships its own
+source. The simulator runs synthetic traffic through a small microservice system. Faults can be
+planted (Step 2b), and because we planted them, the true cause is known. That makes accuracy
+measurable, makes the benchmark reproducible, and gives every reader a demo that needs none of
+their own data.
+
+**The `shop` system** has 8 services. Arrows mean "calls", and checkout is called on 30% of requests:
+
+```text
+frontend ─┬─> auth
+          ├─> catalog ──> catalog-db
+          └─> checkout (30%) ─┬─> cart ─────> payments-db
+                              └─> payments ─> payments-db
+```
+
+`payments-db` has two callers, so a fault there creates victims along two paths.
+
+**How one request is simulated:**
+
+| Rule | Detail |
+|---|---|
+| Arrivals | Poisson process at the requested `rps`, entering at `frontend`. |
+| Own processing time | Lognormal around each service's median (`base_ms`, jitter sigma 0.25), split half before and half after its calls. |
+| Calls | Made one after another, in topology order. A span's duration is its own time plus its callees' time. |
+| Errors | Each service fails by itself with probability `error_rate` (0.1% by default). A failure propagates to the caller, which stops making further calls. |
+| Timeouts | Each call has a timeout. If the callee is slower, the caller gives up and fails, while the callee's own span keeps running, as in real systems. Healthy `shop` latencies are at least 5x below every timeout. |
+| Metrics | Computed from **every** request, per service, per interval (default 1 s): p50/p95/p99 latency, error rate, throughput. |
+| Traces | **Head-sampled** (default 10%): a request's whole trace is kept or dropped. |
+| Window | The run records spans that *start* inside `[start, start + duration)`, like an export cut at end time. |
+| Determinism | One seeded generator (`random.Random(seed)`) drives everything. The same seed gives byte-identical files. |
+
+**Measured** (macOS x86_64, Python 3.12, `duration="10m", rps=50, seed=7`):
+
+| Quantity | Value |
+|---|---|
+| Requests simulated | 29,721 (Poisson mean 30,000) |
+| Traces kept | 2,927 (9.85%) with 15,679 spans, 5.36 spans per trace |
+| Simulation time | 1.01 s, plus 0.14 s to write the files |
+| Folder size | 4.8 MB (3.8 MB traces, 1.0 MB metrics) |
+
+## Usage
+
+### Works today: simulate a system and save the telemetry
+
+```python
+from tracehound.sim import System
+
+system = System.example("shop")
+run = system.run(duration="10m", rps=50, seed=7)  # trace_sample_rate=0.1, metric_interval_s=1.0
+print(run.n_requests, len(run.spans))  # 29721 15679
+run.save("runs/shop_seed7/")  # meta.json, metrics.csv, traces.jsonl, ground_truth.json
+```
+
+### Planned API
+
+> *Planned.* This is the target public surface, built step by step; see the [Roadmap](#roadmap).
 
 ```python
 import tracehound as th
@@ -130,7 +187,7 @@ result = th.guard(candidate="runs/pr_241/", baseline="runs/main/")  # baseline: 
 assert result.ok, result.regressions
 ```
 
-Generate a labelled incident with the built-in simulator. The fault is planted, so the true cause is known:
+Plant a fault (Step 2b), so the true cause is known:
 
 ```python
 from tracehound.sim import System, Fault
@@ -197,6 +254,12 @@ timestamp_ms,service,metric,value
 | `error_rate` | fraction 0-1 | up |
 | `throughput_rps` | requests / second | down |
 | anything else (e.g. `db_connections`) | as named | either (two-sided) |
+
+Rules for `metrics.csv`:
+- `timestamp_ms` is the **start** of the interval. A request counts in the interval in which it started.
+- An interval with no requests has only `throughput_rps = 0`. Latency and error rate are left out,
+  because they are undefined for zero requests and are never invented.
+- Values are rounded to 4 decimals, with trailing zeros dropped (`3`, `41.2`, `0.0012`).
 
 **`traces.jsonl`** has one span per line, sorted by `start_ns`, then `span_id`:
 
@@ -266,7 +329,7 @@ pip install -e . --group dev            # pytest, ruff, mypy
 ruff check .            # lint
 ruff format --check .   # formatting
 mypy                    # strict type checking
-pytest                  # tests (including the repository rules)
+pytest                  # tests, docstring examples (doctests) and the repository rules
 ```
 
 CI runs the same four checks on Python 3.12, 3.13 and 3.14, on Linux and macOS.
@@ -285,14 +348,22 @@ CI runs the same four checks on Python 3.12, 3.13 and 3.14, on Linux and macOS.
 tracehound/
 ├── src/tracehound/
 │   ├── __init__.py      public API: load(), explain(), guard()  (built step by step)
+│   ├── _format.py       incident-folder constants shared by every writer and reader
 │   ├── ingest/          stage 1: incident folder -> typed data
 │   ├── detect/          stage 2: anomaly + onset detection (robust z, CUSUM)
 │   ├── correlate/       stage 3: group anomalies into one incident
 │   ├── graph/           stage 4: build call graph, rank root causes
 │   ├── report/          stage 5: JSON + text renderers
 │   ├── sim/             fault-injection simulator (ground-truth incidents)
+│   │   ├── topology.py    Service, Call, Topology (validated: acyclic, all reachable)
+│   │   ├── examples.py    ready-made systems, e.g. "shop"
+│   │   ├── request.py     one request -> one span per service (latency, errors, timeouts)
+│   │   ├── metrics.py     spans -> per-interval p50/p95/p99, error rate, throughput
+│   │   ├── writer.py      deterministic incident-folder writer
+│   │   ├── system.py      System.run(): traffic, sampling, recording window -> SimRun
+│   │   └── units.py       "10m" / "30s" duration parsing
 │   └── bench/           benchmark harness -> results.json
-├── tests/               unit tests per stage + end-to-end scenarios
+├── tests/               unit tests per stage + end-to-end scenarios (tests/sim/ for the simulator)
 └── pyproject.toml       packaging + tool configuration
 ```
 
@@ -303,7 +374,8 @@ Each step is built, tested and pushed on its own.
 | Step | What | Done when | Status |
 |---|---|---|---|
 | 1 | Project skeleton, tooling, CI, format spec | Installs; lint, types and tests pass | ✅ done |
-| 2 | Simulator | Same seed -> byte-identical incident folder; 4 fault types | ⏳ next |
+| 2a | Simulator: healthy traffic | Same seed -> byte-identical folder, also across processes | ✅ done |
+| 2b | Simulator: fault injection | 4 fault types; faults spread to callers; ground truth written | ⏳ next |
 | 3 | Ingest + Detect | Folder round-trips; detector accuracy and onset error measured | planned |
 | 4 | Graph + Localize | Top-1/Top-3/MRR with intervals on dev seeds; ablation table | planned |
 | 5 | Explain report | Golden-file tests; identical bytes across processes | planned |

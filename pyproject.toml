@@ -64,6 +64,6 @@ python_version = "3.12"
 files = ["src", "tests"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests", "src"]
+addopts = "-ra --strict-markers --strict-config --doctest-modules"
 xfail_strict = true
