@@ -9,9 +9,9 @@ no API key, benchmarked on a built-in fault simulator.
 ![Python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-> **Status: pre-alpha. Steps 1, 2 and 3a of the roadmap are done: project skeleton, CI, a
-> fault-injection simulator that produces labelled incidents, and `tracehound.load()`, which reads
-> and validates an incident folder.**
+> **Status: pre-alpha. Steps 1-3 of the roadmap are done: project skeleton, CI, a fault-injection
+> simulator that produces labelled incidents, `tracehound.load()`, which reads and validates an
+> incident folder, and anomaly detection with onset times, measured on held-out incidents.**
 > Tracehound is being built in small, tested, separately-committed steps. Anything marked
 > *planned* below does not work yet. The [Roadmap](#roadmap) shows exactly what exists today.
 
@@ -89,7 +89,7 @@ incident folder --> 1 Ingest --> 2 Detect --> 3 Correlate --> 4 Localize --> 5 R
 | Stage | Does | Technique (no model, no key) |
 |---|---|---|
 | 1 Ingest | Reads and validates metrics and trace spans into typed, columnar data | stdlib `csv`/`json` + numpy |
-| 2 Detect | Flags anomalous signals against their own pre-incident baseline and estimates **when** each change began | robust z-score (median/MAD) + CUSUM change-point |
+| 2 Detect | Compares each signal with its own baseline and finds the stretch of time in which it moved away from normal: **when** it began, when it ended, how far it moved | robust baseline (median/MAD) + scan statistic + minimum effect size ([details](#how-detect-finds-an-anomaly-and-its-onset)) |
 | 3 Correlate | Groups anomalies that begin close together into one incident | 1-D gap clustering on onset times |
 | 4 Localize | Builds the service graph from traces and ranks the most likely cause | networkx + personalized PageRank + timing |
 | 5 Report | Emits ranked hypotheses with evidence | deterministic JSON + text renderer |
@@ -101,14 +101,91 @@ incident folder --> 1 Ingest --> 2 Detect --> 3 Correlate --> 4 Localize --> 5 R
 2. **Faults travel the other way.** A slow or failing *callee* makes its *callers* slow or fail. So
    blame flows from each victim towards the services it calls.
 3. **Score each anomalous service** on three signals:
-   - **onset**: it started misbehaving earliest. This is the estimated change-point, not the
-     moment an alarm fired, because large changes trip alarms sooner.
+   - **onset**: it started misbehaving earliest. This is the estimated start of the change, not
+     the moment an alarm fired, because large changes trip alarms sooner.
    - **magnitude**: how strong its anomaly is.
    - **coverage**: how many anomalous callers its fault explains.
 4. **Propagate** with a personalized PageRank walk from victims toward the services they call,
    which concentrates blame on the service that explains the most damage.
 5. **Rank and explain.** The output is the top-k services, each with a `score` (its share of the
    blame, summing to 1 across candidates) and the concrete evidence behind it.
+
+### How Detect finds an anomaly and its onset
+
+Detect runs on every metric series of every service. It looks for *one stretch of time* in
+which the signal moved away from normal in its bad direction. Latency, error rate and utilization
+are bad when they rise; throughput is bad when it falls; any other metric is checked both ways.
+
+1. **Learn normal.** The first third of the recording is the baseline. Normal level = median;
+   noise = MAD x 1.4826. Both ignore outliers, so a fault that starts inside the baseline window
+   can still be found. Error rates are mostly exact zeros, which makes MAD 0; for them, the mean
+   and standard deviation are used instead.
+2. **Standardize.** Each point becomes `z` = its distance from normal, in noise units. A point
+   counts for at most 4 sigma, so a single wild sample cannot create an anomaly on its own.
+3. **Find the strongest stretch.** Among all stretches of time `[start, end)`, find the one with
+   the most evidence of a shift:
+
+   `E = sum(z) / sqrt(L + L^2 * pi / (2 * n_base))`, where `L` is the stretch's length.
+
+   This compares the stretch's average with the baseline median, and the second term accounts
+   for the median being estimated from only `n_base` points. Both edges are found, so a fault
+   that ends before the recording does is reported with its end. The search runs in O(n) per
+   candidate shift size.
+4. **Two tests.** The stretch is reported only if `E >= 7` *and* the change is large enough to
+   matter:
+
+   | Signal | Minimum change |
+   |---|---|
+   | latency | +10% |
+   | error rate | +0.01 |
+   | throughput | -20% |
+   | utilization | +0.05 of capacity |
+   | other metrics | 10% either way |
+
+   On pure Gaussian noise, 7 keeps the chance of a false alarm below 0.1% per signal, for any
+   series length from 40 to 3,600 points. That was measured by simulation, not tuned on the
+   benchmark.
+
+Each `Anomaly` reports:
+- `onset_ns`, `end_ns` and `resolution_ns`: the change began in `[onset_ns, onset_ns + resolution_ns)`;
+- `baseline` and `observed`: the normal level and the median during the stretch;
+- `shift`: in sigma;
+- `evidence`.
+
+This design was chosen by measurement over CUSUM and over a single change-point test. CUSUM
+dated large faults far too early. A single change-point test assumes one change, so it misses
+faults that end.
+
+**Measured on held-out test seeds.** These seeds were never used to choose or tune anything.
+Each set has 100 healthy runs, 100 runs with a fault that lasts to the end, and 60 runs with a
+fault that ends. Every run is a 10 min `shop` run at 50 rps. Each fault is a random kind in a
+random service, starting at a random time. Every number comes from
+`python -m tracehound.bench.detection`; brackets are 95% Wilson intervals.
+
+| | 1 s metrics | 15 s metrics |
+|---|---|---|
+| Healthy runs with any anomaly (48 signals each) | 2 / 100 [0.6%, 7.0%] | 0 / 100 [0%, 3.7%] |
+| Planted cause flagged, fault lasts to the end | 88 / 100 [0.80, 0.93] | 88 / 100 [0.80, 0.93] |
+| Planted cause flagged, fault ends | 51 / 60 [0.74, 0.92] | 50 / 60 [0.72, 0.91] |
+| ... latency / error / saturation faults | 34/34 · 37/37 · 43/43 | 34/34 · 36/37 · 43/43 |
+| ... regression faults (x1.3) | 25 / 46 | 25 / 46 |
+| Onset error, step faults (median, 90th pct of abs) | -0.3 s, 0.9 s | -7.3 s, 12.8 s |
+| Onset lag, saturation ramps (median) | +34 s | +9 s |
+| Time to check one incident (48 signals) | 24 ms | 19 ms |
+
+What these numbers say, and their limits:
+- **Every miss at 1 s is a regression in a service that calls others** (cart, checkout,
+  frontend, payments). For these, +30% of the service's *own* time is only +4% to +10% of its
+  total latency, below the 10% minimum. Seeing them needs self time from traces (Step 4).
+- **The 2 false alarms** were short error-rate bursts (4 s and 8 s), just above the threshold
+  (evidence 7.9).
+- **Onset precision is the metric interval.** It is 1 s with 1 s metrics and up to one interval
+  early with 15 s metrics, where one error fault was flagged a single interval too early and so
+  counts as a miss. Real exports often use 15-60 s, which is why trace timing is planned for
+  Step 4.
+- **Saturation shows up only once the leak stands out from noise,** so its onset lags. The
+  service's callers show it later still, so the order of events is preserved.
+
 
 > **Vocabulary.** Tracehound uses *caller*, *callee*, *victim* and *root cause*. It avoids
 > "upstream" and "downstream", which mean opposite things in call order and in fault order:
@@ -254,6 +331,33 @@ the reason, for example:
 tracehound.IncidentFormatError: incidents/bad/metrics.csv:17: value must be a number, got 'fast'
 ```
 
+### Works today: detect anomalies and when they began
+
+```python
+from tracehound.detect import detect
+
+detection = detect(incident)  # the incident loaded above
+print(len(detection.anomalies), detection.services)
+# 24 ('cart', 'checkout', 'frontend', 'payments', 'payments-db')
+
+for a in detection.of_service("payments-db"):
+    onset_s = (a.onset_ns - incident.meta.start_ns) / 1e9
+    print(
+        f"{a.signal:15s} {a.direction:4s} +{onset_s:.0f}s  "
+        f"{a.baseline:.1f} -> {a.observed:.1f}  shift {a.shift:.0f} sigma"
+    )
+# latency_p50_ms  up   +240s  40.4 -> 895.0  shift 365 sigma
+# latency_p95_ms  up   +240s  57.5 -> 1250.0  shift 256 sigma
+# latency_p99_ms  up   +240s  63.9 -> 1322.1  shift 181 sigma
+# throughput_rps  down +240s  29.0 -> 15.0  shift 2 sigma
+# utilization     up   +240s  0.3 -> 1.0  shift 8 sigma
+```
+
+The fault was planted at +240 s. The cause shows by far the largest shift: 365 sigma against 26
+to 146 for its victims. Five services are flagged, and the three not on the failing path (auth,
+catalog, catalog-db) are not. Telling the cause from its victims is Localize's job (Step 4).
+`detect(incident, DetectConfig(...))` changes the baseline fraction, threshold or 4-sigma cap.
+
 ### Planned API
 
 > *Planned.* This is the target public surface, built step by step; see the [Roadmap](#roadmap).
@@ -392,6 +496,9 @@ Every metric is computed on simulated incidents where the true cause is known. N
 | Guard | False-positive rate on clean runs | <= 0.05 | not measured yet |
 | Engine | Time to localize one incident | report only | not measured yet |
 
+Stage results measured so far: **Detect** (stage 2), on held-out seeds. See
+[How Detect finds an anomaly and its onset](#how-detect-finds-an-anomaly-and-its-onset).
+
 The protocol keeps these numbers honest:
 
 - **Held-out seeds.** Parameters are tuned on *dev* seeds. The reported scores come from separate *test* seeds.
@@ -430,6 +537,10 @@ ruff check .            # lint
 ruff format --check .   # formatting
 mypy                    # strict type checking
 pytest                  # tests, docstring examples (doctests) and the repository rules
+
+# Reproduce the Detect numbers in this README (held-out seeds, about 5 min on 4 cores)
+python -m tracehound.bench.detection --split test --workers 4
+python -m tracehound.bench.detection --split test --interval 15 --workers 4
 ```
 
 CI runs the same four checks on Python 3.12, 3.13 and 3.14, on Linux and macOS.
@@ -456,7 +567,12 @@ tracehound/
 │   │   ├── spans.py       Spans: every span as numpy columns, sorted by start time
 │   │   ├── ground_truth.py  GroundTruth and PlantedFault (simulated runs)
 │   │   └── _checks.py     IncidentFormatError and typed field checks
-│   ├── detect/          stage 2: anomaly + onset detection (robust z, CUSUM)
+│   ├── detect/          stage 2: anomaly + onset detection
+│   │   ├── detector.py    detect(incident) and detect_series(...)
+│   │   ├── scan.py        the strongest shifted stretch (scan statistic)
+│   │   ├── baseline.py    normal level and noise (median/MAD, or mean/std for mostly-zero data)
+│   │   ├── signals.py     bad direction and minimum effect per metric
+│   │   └── anomaly.py     Anomaly, Detection, DetectConfig
 │   ├── correlate/       stage 3: group anomalies into one incident
 │   ├── graph/           stage 4: build call graph, rank root causes
 │   ├── report/          stage 5: JSON + text renderers
@@ -469,8 +585,11 @@ tracehound/
 │   │   ├── writer.py      deterministic incident-folder writer
 │   │   ├── system.py      System.run(): traffic, sampling, recording window -> SimRun
 │   │   └── units.py       "10m" / "30s" duration parsing
-│   └── bench/           benchmark harness -> results.json
-├── tests/               unit tests per stage + end-to-end scenarios (tests/sim/, tests/ingest/)
+│   └── bench/           benchmark harness (results.json: planned)
+│       ├── scenarios.py   deterministic dev/test scenarios with one random planted fault
+│       ├── detection.py   scores Detect: false alarms, cause found, onset error
+│       └── stats.py       Wilson intervals and summaries
+├── tests/               unit tests per stage + end-to-end scenarios (sim/, ingest/, detect/, bench/)
 └── pyproject.toml       packaging + tool configuration
 ```
 
@@ -484,8 +603,8 @@ Each step is built, tested and pushed on its own.
 | 2a | Simulator: healthy traffic | Same seed -> byte-identical folder, also across processes | ✅ done |
 | 2b | Simulator: fault injection | 4 fault types; faults spread to callers; ground truth written | ✅ done |
 | 3a | Ingest | Simulator output round-trips exactly; every format rule rejects bad input with file and line | ✅ done |
-| 3b | Detect | Detector recall, false-alarm rate and onset error measured against ground truth | ⏳ next |
-| 4 | Graph + Localize | Top-1/Top-3/MRR with intervals on dev seeds; ablation table | planned |
+| 3b | Detect | Detector recall, false-alarm rate and onset error measured against ground truth | ✅ done |
+| 4 | Graph + Localize | Top-1/Top-3/MRR with intervals on dev seeds; ablation table | ⏳ next |
 | 5 | Explain report | Golden-file tests; identical bytes across processes | planned |
 | 6 | Guard | Recall >= 0.90 and FPR <= 0.05 on held-out seeds | planned |
 | 7 | Benchmark + scoreboard | `results.json` generates this README's numbers | planned |
